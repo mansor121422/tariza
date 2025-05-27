@@ -1,0 +1,50 @@
+[24-May-2025 10:55:25 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:26 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:27 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:27 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:38 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:39 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:39 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 10:55:44 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\admin\reservations.php(3): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 11:05:58 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\user\payment-success.php(7): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+[24-May-2025 11:06:20 Europe/Berlin] Database connection failed: SQLSTATE[HY000] [1049] Unknown database 'tariza_db'
+DSN: mysql:host=127.0.0.1;port=3306;dbname=tariza_db;charset=utf8mb4
+Trace: #0 C:\xampp\htdocs\Tariza\includes\config.php(39): PDO->__construct('mysql:host=127....', 'root', Object(SensitiveParameterValue), Array)
+#1 C:\xampp\htdocs\Tariza\update_database.php(2): require_once('C:\\xampp\\htdocs...')
+#2 {main}

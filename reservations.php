@@ -1,481 +1,598 @@
 <?php
 session_start();
-require_once '../config/database.php';
-require_once '../includes/ReservationHandler.php';
+require_once 'config/database.php';
 
-// Check if user is logged in and is admin
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
-    header('Location: ../login.php');
+// Check if user is logged in
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
     exit();
 }
 
-// Define valid status transitions and their properties
-$status_info = [
-    'pending' => [
-        'class' => 'warning',
-        'icon' => 'clock',
-        'transitions' => ['confirmed', 'cancelled']
-    ],
-    'confirmed' => [
-        'class' => 'success',
-        'icon' => 'check-circle',
-        'transitions' => ['completed', 'cancelled']
-    ],
-    'completed' => [
-        'class' => 'info',
-        'icon' => 'check-double',
-        'transitions' => []
-    ],
-    'cancelled' => [
-        'class' => 'danger',
-        'icon' => 'times-circle',
-        'transitions' => []
-    ]
-];
+$success = '';
+$error = '';
 
-// Handle reservation status updates
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_status'])) {
+// Handle reservation cancellation
+if (isset($_POST['cancel_reservation']) && isset($_POST['reservation_id'])) {
+    $reservation_id = (int)$_POST['reservation_id'];
+    
+    // Start transaction
+    $conn->beginTransaction();
+    
     try {
-        $reservation_id = (int)$_POST['reservation_id'];
-        $new_status = $_POST['status'];
-        $current_status = $_POST['current_status'];
-        
-        // Validate status transition
-        if (!isset($status_info[$current_status]) || 
-            !in_array($new_status, $status_info[$current_status]['transitions'])) {
-            throw new Exception("Invalid status transition from " . ucfirst($current_status) . " to " . ucfirst($new_status));
-        }
-        
-        // Start transaction
-        $conn->beginTransaction();
-        
-        // Get reservation details with room info
-        $stmt = $conn->prepare("
-            SELECT r.*, rm.name as room_name, rm.status as room_status,
-                   u.email, u.username
-            FROM reservations r
-            JOIN rooms rm ON r.room_id = rm.id
-            JOIN users u ON r.user_id = u.id
-            WHERE r.id = ?
-            FOR UPDATE
-        ");
-        $stmt->execute([$reservation_id]);
+        // Verify ownership of the reservation and get room_id
+        $stmt = $conn->prepare("SELECT id, room_id FROM reservations WHERE id = ? AND user_id = ?");
+        $stmt->execute([$reservation_id, $_SESSION['user_id']]);
         $reservation = $stmt->fetch();
         
-        if (!$reservation) {
-            throw new Exception('Reservation not found');
-        }
-        
-        if ($reservation['status'] !== $current_status) {
-            throw new Exception('Reservation status has been changed by another user');
-        }
-        
-        // Additional validation based on new status
-        if ($new_status === 'confirmed') {
-            // Check payment status
-            if ($reservation['payment_status'] !== 'paid' && $reservation['payment_method'] !== 'cash') {
-                throw new Exception('Cannot confirm reservation: Payment is not completed');
-            }
+        if ($reservation) {
+            // Update reservation status
+            $stmt = $conn->prepare("UPDATE reservations SET status = 'cancelled' WHERE id = ?");
+            $stmt->execute([$reservation_id]);
             
-            // Check for conflicting reservations
+            // Check if there are other confirmed reservations for this room
             $stmt = $conn->prepare("
-                SELECT COUNT(*) as conflicts
-                FROM reservations 
-                WHERE room_id = ? 
-                AND status = 'confirmed'
-                AND id != ?
-                AND (
-                    (checkin < ? AND checkout > ?) OR
-                    (checkin < ? AND checkout > ?) OR
-                    (checkin >= ? AND checkout <= ?)
-                )
-            ");
-            $stmt->execute([
-                $reservation['room_id'],
-                $reservation_id,
-                $reservation['checkout'],
-                $reservation['checkin'],
-                $reservation['checkout'],
-                $reservation['checkout'],
-                $reservation['checkin'],
-                $reservation['checkout']
-            ]);
-            
-            if ($stmt->fetch()['conflicts'] > 0) {
-                throw new Exception("Cannot confirm reservation: Room {$reservation['room_name']} has conflicting bookings");
-            }
-            
-            // Check if room is under maintenance
-            if ($reservation['room_status'] === 'maintenance') {
-                throw new Exception("Cannot confirm reservation: Room {$reservation['room_name']} is under maintenance");
-            }
-        }
-        
-        // Update reservation status
-        $stmt = $conn->prepare("
-            UPDATE reservations 
-            SET status = ?,
-                updated_at = NOW(),
-                status_updated_by = ?
-            WHERE id = ?
-        ");
-        
-        if (!$stmt->execute([$new_status, $_SESSION['user_id'], $reservation_id])) {
-            throw new Exception('Failed to update reservation status');
-        }
-        
-        // Update room status based on reservation status
-        if ($new_status === 'confirmed') {
-            $stmt = $conn->prepare("
-                UPDATE rooms 
-                SET status = 'unavailable',
-                    last_booked = NOW(),
-                    updated_at = NOW()
-                WHERE id = ?
-            ");
-            $stmt->execute([$reservation['room_id']]);
-        } elseif (in_array($new_status, ['cancelled', 'completed'])) {
-            // Check if there are other active confirmed reservations
-            $stmt = $conn->prepare("
-                SELECT COUNT(*) as active_bookings
+                SELECT COUNT(*) as count 
                 FROM reservations 
                 WHERE room_id = ? 
                 AND status = 'confirmed' 
                 AND id != ?
-                AND checkout > NOW()
             ");
             $stmt->execute([$reservation['room_id'], $reservation_id]);
+            $result = $stmt->fetch();
             
-            if ($stmt->fetch()['active_bookings'] == 0) {
-                $stmt = $conn->prepare("
-                    UPDATE rooms 
-                    SET status = 'available',
-                        updated_at = NOW()
-                    WHERE id = ?
-                ");
+            if ($result['count'] == 0) {
+                // No other confirmed reservations, make room available
+                $stmt = $conn->prepare("UPDATE rooms SET status = 'available' WHERE id = ?");
                 $stmt->execute([$reservation['room_id']]);
             }
-        }
-        
-        // Log the status change
-        $stmt = $conn->prepare("
-            INSERT INTO reservation_logs (
-                reservation_id,
-                user_id,
-                action,
-                old_status,
-                new_status,
-                created_at
-            ) VALUES (?, ?, 'status_change', ?, ?, NOW())
-        ");
-        $stmt->execute([
-            $reservation_id,
-            $_SESSION['user_id'],
-            $current_status,
-            $new_status
-        ]);
-        
-        // Commit transaction
-        $conn->commit();
-        
-        // Set success message
-        $_SESSION['success_message'] = "Reservation #{$reservation_id} status updated to " . ucfirst($new_status);
-        
-        // Send email notification
-        try {
-            $to = $reservation['email'];
-            $subject = "Reservation Status Updated - #{$reservation_id}";
-            $message = "Dear " . htmlspecialchars($reservation['username']) . ",\n\n";
-            $message .= "Your reservation status has been updated to " . ucfirst($new_status) . ".\n\n";
-            $message .= "Reservation Details:\n";
-            $message .= "Room: " . htmlspecialchars($reservation['room_name']) . "\n";
-            $message .= "Check-in: " . date('F j, Y g:i A', strtotime($reservation['checkin'])) . "\n";
-            $message .= "Check-out: " . date('F j, Y g:i A', strtotime($reservation['checkout'])) . "\n";
-            $message .= "\nThank you for choosing our service.\n";
             
-            $headers = "From: no-reply@example.com";
-            
-            mail($to, $subject, $message, $headers);
-        } catch (Exception $e) {
-            error_log("Failed to send status update email: " . $e->getMessage());
+            $conn->commit();
+            $success = 'Reservation cancelled successfully';
+        } else {
+            throw new Exception('Invalid reservation');
         }
-        
     } catch (Exception $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
-        }
-        $_SESSION['error_message'] = $e->getMessage();
+        $conn->rollBack();
+        $error = $e->getMessage();
     }
-    
-    // Redirect to prevent form resubmission
-    header('Location: ' . $_SERVER['PHP_SELF']);
-    exit();
 }
 
+// Get user's statistics
+$stmt = $conn->prepare("SELECT COUNT(*) as total FROM reservations WHERE user_id = ?");
+$stmt->execute([$_SESSION['user_id']]);
+$total_reservations = $stmt->fetch()['total'];
+
+$stmt = $conn->prepare("SELECT COUNT(*) as pending FROM reservations WHERE user_id = ? AND status = 'pending'");
+$stmt->execute([$_SESSION['user_id']]);
+$pending_reservations = $stmt->fetch()['pending'];
+
+$stmt = $conn->prepare("SELECT COUNT(*) as confirmed FROM reservations WHERE user_id = ? AND status = 'confirmed'");
+$stmt->execute([$_SESSION['user_id']]);
+$confirmed_reservations = $stmt->fetch()['confirmed'];
+
+// Fetch user's reservations$stmt = $conn->prepare("    SELECT r.*, rm.name as room_name     FROM reservations r    LEFT JOIN rooms rm ON r.room_id = rm.id     WHERE r.user_id = ?     ORDER BY r.checkin DESC");$stmt->execute([$_SESSION['user_id']]);$reservations = $stmt->fetchAll();
+
+// Fetch available rooms for the modal
+$stmt = $conn->query("SELECT * FROM rooms WHERE status = 'available' ORDER BY name");
+$available_rooms = $stmt->fetchAll();
+
 // Set page title
-$page_title = "Manage Reservations";
-
-// Fetch all reservations with user and room details
-$stmt = $conn->query("
-    SELECT r.*, 
-           u.username as user_name, 
-           u.email as user_email,
-           rm.name as room_name,
-           rm.capacity as room_capacity,
-           rm.price as room_price,
-           rm.status as room_status
-    FROM reservations r
-    JOIN users u ON r.user_id = u.id
-    JOIN rooms rm ON r.room_id = rm.id
-    ORDER BY r.created_at DESC
-");
-$reservations = $stmt->fetchAll();
-
-// Include header
-include 'components/header.php';
-// Include sidebar
-include 'components/sidebar.php';
+$page_title = "My Reservations";
 ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Room Reservation - <?php echo $page_title; ?></title>
 
-<!-- Content Wrapper. Contains page content -->
-<div class="content-wrapper">
-    <!-- Content Header (Page header) -->
-    <div class="content-header">
-        <div class="container-fluid">
-            <div class="row mb-2">
-                <div class="col-sm-6">
-                    <h1 class="m-0">Manage Reservations</h1>
+    <!-- Google Font: Source Sans Pro -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Source+Sans+Pro:300,400,400i,700&display=fallback">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+    <!-- Theme style -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/css/adminlte.min.css">
+    <!-- DataTables -->
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.10.24/css/dataTables.bootstrap4.min.css">
+    <style>
+        .navbar-brand img {
+            height: 40px;
+            margin-right: 10px;
+        }
+        .main-header {
+            border: none;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .reservation-card {
+            transition: transform 0.2s;
+        }
+        .reservation-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        /* Price Display Styles */
+        .selected-room-info {
+            background-color: #f8f9fa;
+            border-left: 4px solid #17a2b8;
+            margin: 15px 0;
+        }
+        .selected-room-info p {
+            margin: 10px 0;
+            font-size: 1.1em;
+        }
+        .selected-room-info .room-price {
+            color: #28a745;
+            font-weight: 600;
+            font-size: 1.2em;
+        }
+        .selected-room-info .room-capacity {
+            color: #17a2b8;
+            font-weight: 600;
+        }
+        .price-calculation {
+            background-color: #f8fff9;
+            border: none;
+            border-left: 4px solid #28a745;
+            margin: 20px 0;
+            padding: 15px;
+        }
+        .price-calculation .alert-heading {
+            color: #28a745;
+            font-size: 1.2em;
+            font-weight: 600;
+            margin-bottom: 15px;
+        }
+        .price-calculation p {
+            font-size: 1.1em;
+            margin-bottom: 10px;
+        }
+        .price-calculation .num-days,
+        .price-calculation .price-per-day {
+            font-weight: 500;
+            color: #495057;
+        }
+        .price-calculation hr {
+            border-top: 2px solid #e9ecef;
+            margin: 15px 0;
+        }
+        .price-calculation .total-price {
+            color: #28a745;
+            font-size: 1.3em;
+            font-weight: 700;
+        }
+        /* Form Field Styles */
+        .form-group label {
+            font-weight: 600;
+            color: #495057;
+        }
+        .form-control {
+            border-radius: 4px;
+            border: 1px solid #ced4da;
+            padding: 8px 12px;
+        }
+        .form-control:focus {
+            border-color: #80bdff;
+            box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
+        }
+        .form-text.text-muted {
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        /* Modal Styles */
+        .modal-content {
+            border: none;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .modal-header {
+            background-color: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            border-radius: 8px 8px 0 0;
+        }
+        .modal-title {
+            color: #495057;
+            font-weight: 600;
+        }
+        .modal-footer {
+            background-color: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+            border-radius: 0 0 8px 8px;
+        }
+        /* Button Styles */
+        .btn-primary {
+            background-color: #007bff;
+            border: none;
+            padding: 8px 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .btn-primary:hover {
+            background-color: #0069d9;
+            transform: translateY(-1px);
+        }
+        .btn-secondary {
+            background-color: #6c757d;
+            border: none;
+            padding: 8px 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .btn-secondary:hover {
+            background-color: #5a6268;
+            transform: translateY(-1px);
+        }
+    </style>
+</head>
+<body class="hold-transition layout-top-nav">
+<div class="wrapper">
+    <!-- Navbar -->
+    <nav class="main-header navbar navbar-expand-md navbar-light navbar-white">
+        <div class="container">
+            <a href="index.php" class="navbar-brand">
+                <img src="assets/img/logo.png" alt="Logo" class="brand-image">
+                <span class="brand-text font-weight-light">Room Reservation</span>
+            </a>
+
+            <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarCollapse">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+
+            <div class="collapse navbar-collapse" id="navbarCollapse">
+                <ul class="navbar-nav ml-auto">
+                    <li class="nav-item">
+                        <a href="index.php" class="nav-link">
+                            <i class="fas fa-home"></i> Home
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="profile.php" class="nav-link">
+                            <i class="fas fa-user"></i> Profile
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="logout.php" class="nav-link">
+                            <i class="fas fa-sign-out-alt"></i> Logout
+                        </a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Content Wrapper -->
+    <div class="content-wrapper">
+        <!-- Content Header -->
+        <div class="content-header">
+            <div class="container">
+                <div class="row mb-2">
+                    <div class="col-sm-6">
+                        <h1 class="m-0">My Reservations</h1>
+                    </div>
+                    <div class="col-sm-6">
+                        <button type="button" class="btn btn-primary float-sm-right" data-toggle="modal" data-target="#reservationModal">
+                            <i class="fas fa-plus"></i> New Reservation
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main content -->
+        <div class="content">
+            <div class="container">
+                <?php if ($success): ?>
+                    <div class="alert alert-success alert-dismissible">
+                        <button type="button" class="close" data-dismiss="alert" aria-hidden="true">×</button>
+                        <?php echo $success; ?>
+                    </div>
+                <?php endif; ?>
+                <?php if ($error): ?>
+                    <div class="alert alert-danger alert-dismissible">
+                        <button type="button" class="close" data-dismiss="alert" aria-hidden="true">×</button>
+                        <?php echo $error; ?>
+                    </div>
+                <?php endif; ?>
+
+                <!-- Statistics -->
+                <div class="row">
+                    <div class="col-12 col-sm-4">
+                        <div class="info-box">
+                            <span class="info-box-icon bg-info"><i class="fas fa-calendar-check"></i></span>
+                            <div class="info-box-content">
+                                <span class="info-box-text">Total</span>
+                                <span class="info-box-number"><?php echo $total_reservations; ?></span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-12 col-sm-4">
+                        <div class="info-box">
+                            <span class="info-box-icon bg-warning"><i class="fas fa-clock"></i></span>
+                            <div class="info-box-content">
+                                <span class="info-box-text">Pending</span>
+                                <span class="info-box-number"><?php echo $pending_reservations; ?></span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-12 col-sm-4">
+                        <div class="info-box">
+                            <span class="info-box-icon bg-success"><i class="fas fa-check"></i></span>
+                            <div class="info-box-content">
+                                <span class="info-box-text">Confirmed</span>
+                                <span class="info-box-number"><?php echo $confirmed_reservations; ?></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Reservations List -->
+                <div class="card">
+                    <div class="card-body">
+                        <?php if (empty($reservations)): ?>
+                            <div class="text-center py-5">
+                                <i class="fas fa-calendar fa-4x text-muted mb-3"></i>
+                                <h4 class="text-muted">No Reservations Yet</h4>
+                                <p class="text-muted">Click the "New Reservation" button to make your first reservation.</p>
+                            </div>
+                        <?php else: ?>
+                            <table id="reservationsTable" class="table table-bordered table-striped">
+                                                                <thead>                                    <tr>                                        <th>Room</th>                                        <th>Check-in</th>                                        <th>Check-out</th>                                        <th>Purpose</th>                                        <th>Status</th>                                        <th>Actions</th>                                    </tr>                                </thead>                                <tbody>                                    <?php foreach ($reservations as $reservation): ?>                                    <tr>                                        <td><?php echo htmlspecialchars($reservation['room_name']); ?></td>                                        <td><?php echo date('M d, Y g:i A', strtotime($reservation['checkin'])); ?></td>                                        <td><?php echo date('M d, Y g:i A', strtotime($reservation['checkout'])); ?></td>                                        <td><?php echo htmlspecialchars($reservation['purpose']); ?></td>                                        <td>                                            <span class="badge badge-<?php                                                 echo $reservation['status'] === 'confirmed' ? 'success' :                                                     ($reservation['status'] === 'pending' ? 'warning' : 'danger');                                             ?>">                                                <?php echo ucfirst($reservation['status']); ?>                                            </span>                                        </td>                                        <td>                                            <?php if ($reservation['status'] != 'cancelled' && strtotime($reservation['checkin']) > time()): ?>
+                                                <form method="POST" action="" style="display: inline;">
+                                                    <input type="hidden" name="reservation_id" value="<?php echo $reservation['id']; ?>">
+                                                    <button type="submit" name="cancel_reservation" class="btn btn-danger btn-sm" 
+                                                        onclick="return confirm('Are you sure you want to cancel this reservation?')">
+                                                        <i class="fas fa-times"></i> Cancel
+                                                    </button>
+                                                </form>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        <?php endif; ?>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Main content -->
-    <section class="content">
-        <div class="container-fluid">
-            <?php if (isset($_SESSION['success_message'])): ?>
-                <div class="alert alert-success alert-dismissible">
-                    <button type="button" class="close" data-dismiss="alert" aria-hidden="true">×</button>
-                    <?php 
-                    echo $_SESSION['success_message'];
-                    unset($_SESSION['success_message']);
-                    ?>
+    <!-- Reservation Modal -->
+    <div class="modal fade" id="reservationModal">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h4 class="modal-title">New Reservation</h4>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <span aria-hidden="true">&times;</span>
+                    </button>
                 </div>
-            <?php endif; ?>
+                <form action="process-reservation.php" method="POST" id="reservationForm">
+                    <div class="modal-body">
+                        <!-- Room Selection -->
+                        <div class="form-group">
+                            <label for="room_id">Select Room</label>
+                            <select class="form-control" id="room_id" name="room_id" required>
+                                <option value="">Choose a room...</option>
+                                <?php foreach ($available_rooms as $room): ?>
+                                    <option value="<?php echo $room['id']; ?>" 
+                                            data-price="<?php echo $room['price']; ?>"
+                                            data-capacity="<?php echo $room['capacity']; ?>">
+                                        <?php echo htmlspecialchars($room['name']); ?> 
+                                        (Capacity: <?php echo $room['capacity']; ?> - ₱<?php echo number_format($room['price'], 2); ?>/day)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
 
-            <?php if (isset($_SESSION['error_message'])): ?>
-                <div class="alert alert-danger alert-dismissible">
-                    <button type="button" class="close" data-dismiss="alert" aria-hidden="true">×</button>
-                    <?php 
-                    echo $_SESSION['error_message'];
-                    unset($_SESSION['error_message']);
-                    ?>
-                </div>
-            <?php endif; ?>
+                        <!-- Room Details -->
+                        <div class="selected-room-info" style="display: none;">
+                            <div class="alert alert-info">
+                                <p class="mb-1"><strong>Room Price:</strong> ₱<span class="room-price">0.00</span> per day</p>
+                                <p class="mb-0"><strong>Maximum Capacity:</strong> <span class="room-capacity">0</span> people</p>
+                            </div>
+                        </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <h3 class="card-title">Reservations List</h3>
-                </div>
-                <div class="card-body">
-                    <table id="reservationsTable" class="table table-bordered table-striped">
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>User</th>
-                                <th>Room</th>
-                                <th>Check-in</th>
-                                <th>Check-out</th>
-                                <th>People</th>
-                                <th>Total Price</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($reservations as $reservation): ?>
-                            <tr>
-                                <td><?php echo str_pad($reservation['id'], 6, '0', STR_PAD_LEFT); ?></td>
-                                <td>
-                                    <?php echo htmlspecialchars($reservation['user_name']); ?><br>
-                                    <small class="text-muted"><?php echo htmlspecialchars($reservation['user_email']); ?></small>
-                                </td>
-                                <td>
-                                    <?php echo htmlspecialchars($reservation['room_name']); ?><br>
-                                    <small class="text-muted">Capacity: <?php echo $reservation['room_capacity']; ?></small>
-                                </td>
-                                <td><?php echo date('M j, Y g:i A', strtotime($reservation['checkin'])); ?></td>
-                                <td><?php echo date('M j, Y g:i A', strtotime($reservation['checkout'])); ?></td>
-                                <td><?php echo $reservation['num_people']; ?></td>
-                                <td>₱<?php echo number_format($reservation['total_price'], 2); ?></td>
-                                <td>
-                                    <?php 
-                                    $status = $reservation['status'];
-                                    $info = $status_info[$status] ?? ['class' => 'secondary', 'icon' => 'question-circle'];
-                                    ?>
-                                    <span class="badge badge-<?php echo $info['class']; ?> px-2 py-1">
-                                        <i class="fas fa-<?php echo $info['icon']; ?> mr-1"></i>
-                                        <?php echo ucfirst($status); ?>
-                                    </span>
-                                </td>
-                                <td>
-                                    <button type="button" class="btn btn-info btn-sm" data-toggle="modal" 
-                                            data-target="#viewReservationModal<?php echo $reservation['id']; ?>">
-                                        <i class="fas fa-eye"></i>
-                                    </button>
-                                    <button type="button" class="btn btn-primary btn-sm" data-toggle="modal" 
-                                            data-target="#updateStatusModal<?php echo $reservation['id']; ?>">
-                                        <i class="fas fa-edit"></i>
-                                    </button>
-                                </td>
-                            </tr>
-
-                            <!-- View Reservation Modal -->
-                            <div class="modal fade" id="viewReservationModal<?php echo $reservation['id']; ?>">
-                                <div class="modal-dialog">
-                                    <div class="modal-content">
-                                        <div class="modal-header">
-                                            <h4 class="modal-title">Reservation Details</h4>
-                                            <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-                                                <span aria-hidden="true">&times;</span>
-                                            </button>
-                                        </div>
-                                        <div class="modal-body">
-                                            <div class="reservation-details">
-                                                <p><strong>Reservation ID:</strong> #<?php echo str_pad($reservation['id'], 6, '0', STR_PAD_LEFT); ?></p>
-                                                <p><strong>User:</strong> <?php echo htmlspecialchars($reservation['user_name']); ?></p>
-                                                <p><strong>Email:</strong> <?php echo htmlspecialchars($reservation['user_email']); ?></p>
-                                                <p><strong>Room:</strong> <?php echo htmlspecialchars($reservation['room_name']); ?></p>
-                                                <p><strong>Check-in:</strong> <?php echo date('F j, Y g:i A', strtotime($reservation['checkin'])); ?></p>
-                                                <p><strong>Check-out:</strong> <?php echo date('F j, Y g:i A', strtotime($reservation['checkout'])); ?></p>
-                                                <p><strong>Number of People:</strong> <?php echo $reservation['num_people']; ?></p>
-                                                <p><strong>Purpose:</strong> <?php echo htmlspecialchars($reservation['purpose']); ?></p>
-                                                <p><strong>Total Price:</strong> ₱<?php echo number_format($reservation['total_price'], 2); ?></p>
-                                                <p><strong>Status:</strong> <?php echo ucfirst($reservation['status']); ?></p>
-                                                <p><strong>Created At:</strong> <?php echo date('F j, Y g:i A', strtotime($reservation['created_at'])); ?></p>
-                                            </div>
-                                        </div>
-                                    </div>
+                        <!-- Dates -->
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="form-group">
+                                    <label for="checkin_date">Check-in Date</label>
+                                    <input type="date" class="form-control" id="checkin_date" name="checkin_date" 
+                                           min="<?php echo date('Y-m-d'); ?>" required>
+                                    <small class="text-muted">Check-in time is fixed at 2:00 PM</small>
                                 </div>
                             </div>
-
-                            <!-- Update Status Modal -->
-                            <div class="modal fade" id="updateStatusModal<?php echo $reservation['id']; ?>">
-                                <div class="modal-dialog">
-                                    <div class="modal-content">
-                                        <div class="modal-header">
-                                            <h4 class="modal-title">Update Reservation Status</h4>
-                                            <button type="button" class="close" data-dismiss="modal" aria-label="Close">
-                                                <span aria-hidden="true">&times;</span>
-                                            </button>
-                                        </div>
-                                        <form method="POST">
-                                            <div class="modal-body">
-                                                <input type="hidden" name="reservation_id" value="<?php echo $reservation['id']; ?>">
-                                                <input type="hidden" name="current_status" value="<?php echo $reservation['status']; ?>">
-                                                <div class="form-group">
-                                                    <label>Current Status</label>
-                                                    <div class="current-status mb-3">
-                                                        <span class="badge badge-<?php echo $status_info[$reservation['status']]['class']; ?> px-3 py-2">
-                                                            <i class="fas fa-<?php echo $status_info[$reservation['status']]['icon']; ?> mr-1"></i>
-                                                            <?php echo ucfirst($reservation['status']); ?>
-                                                        </span>
-                                                    </div>
-                                                    <label for="status">Update Status To</label>
-                                                    <select class="form-control" name="status" required>
-                                                        <?php
-                                                        $available_statuses = $status_info[$reservation['status']]['transitions'];
-                                                        if (!empty($available_statuses)):
-                                                            foreach ($available_statuses as $status):
-                                                                $info = $status_info[$status];
-                                                        ?>
-                                                            <option value="<?php echo $status; ?>" class="text-<?php echo $info['class']; ?>">
-                                                                <?php echo ucfirst($status); ?>
-                                                            </option>
-                                                        <?php 
-                                                            endforeach;
-                                                        else:
-                                                        ?>
-                                                            <option value="" disabled selected>No status changes available</option>
-                                                        <?php endif; ?>
-                                                    </select>
-                                                    <?php if (empty($available_statuses)): ?>
-                                                        <small class="text-muted">
-                                                            This reservation's status cannot be changed further.
-                                                            <?php if ($reservation['status'] === 'cancelled'): ?>
-                                                                Cancelled reservations cannot be reactivated.
-                                                            <?php elseif ($reservation['status'] === 'completed'): ?>
-                                                                Completed reservations cannot be modified.
-                                                            <?php endif; ?>
-                                                        </small>
-                                                    <?php endif; ?>
-                                                </div>
-                                                <?php if (in_array('confirmed', $available_statuses)): ?>
-                                                    <div class="alert alert-info">
-                                                        <i class="fas fa-info-circle"></i> 
-                                                        Confirming this reservation will check for scheduling conflicts and update room availability.
-                                                    </div>
-                                                <?php endif; ?>
-                                            </div>
-                                            <div class="modal-footer">
-                                                <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
-                                                <button type="submit" name="update_status" class="btn btn-primary" 
-                                                        <?php echo empty($available_statuses) ? 'disabled' : ''; ?>>
-                                                    Update Status
-                                                </button>
-                                            </div>
-                                        </form>
-                                    </div>
+                            <div class="col-md-6">
+                                <div class="form-group">
+                                    <label for="checkout_date">Check-out Date</label>
+                                    <input type="date" class="form-control" id="checkout_date" name="checkout_date" 
+                                           min="<?php echo date('Y-m-d'); ?>" required>
+                                    <small class="text-muted">Check-out time is fixed at 12:00 PM</small>
                                 </div>
                             </div>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
+                        </div>
+
+                        <!-- Number of People -->
+                        <div class="form-group">
+                            <label for="num_people">Number of People</label>
+                            <input type="number" class="form-control" id="num_people" name="num_people" 
+                                   min="1" required>
+                            <div class="invalid-feedback">
+                                Number of people exceeds room capacity
+                            </div>
+                        </div>
+
+                        <!-- Purpose -->
+                        <div class="form-group">
+                            <label for="purpose">Purpose of Stay</label>
+                            <textarea class="form-control" id="purpose" name="purpose" rows="3" required></textarea>
+                        </div>
+
+                        <!-- Price Calculation -->
+                        <div class="price-calculation" style="display: none;">
+                            <div class="alert alert-primary">
+                                <h5 class="mb-1">Price Summary</h5>
+                                <p class="mb-1">Number of Days: <span class="num-days">0</span></p>
+                                <p class="mb-1">Price per Day: ₱<span class="price-per-day">0.00</span></p>
+                                <h4 class="mb-0">Total Price: ₱<span class="total-price">0.00</span></h4>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+                        <button type="submit" class="btn btn-primary">Proceed to Payment</button>
+                    </div>
+                </form>
             </div>
         </div>
-    </section>
+    </div>
+
+    <!-- Main Footer -->
+    <footer class="main-footer">
+        <div class="container">
+            <div class="float-right d-none d-sm-inline">
+                Book your space today
+            </div>
+            <strong>Copyright &copy; <?php echo date('Y'); ?> <a href="#">Room Reservation</a>.</strong> All rights reserved.
+        </div>
+    </footer>
 </div>
 
-<!-- Include footer -->
-<?php include 'components/footer.php'; ?>
-
-<!-- Page specific scripts -->
+<!-- REQUIRED SCRIPTS -->
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/js/adminlte.min.js"></script>
+<script src="https://cdn.datatables.net/1.10.24/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.10.24/js/dataTables.bootstrap4.min.js"></script>
 <script>
-    $(document).ready(function() {
-        $('#reservationsTable').DataTable({
-            "paging": true,
-            "lengthChange": true,
-            "searching": true,
-            "ordering": true,
-            "info": true,
-            "autoWidth": false,
-            "responsive": true,
-            "order": [[3, "desc"]] // Sort by check-in date by default
-        });
+$(document).ready(function() {
+    // Initialize date inputs with min date
+    var today = new Date().toISOString().split('T')[0];
+    $('#checkin_date, #checkout_date').attr('min', today);
+    
+    // Show room info when a room is selected
+    $('#room_id').change(function() {
+        var selectedOption = $(this).find('option:selected');
+        var price = selectedOption.data('price');
+        var capacity = selectedOption.data('capacity');
         
-        // Add animation to status changes
-        $('.badge').addClass('transition');
-        
-        // Confirm status changes
-        $('form[name="update_status"]').on('submit', function(e) {
-            e.preventDefault();
-            const currentStatus = $(this).find('input[name="current_status"]').val();
-            const newStatus = $(this).find('select[name="status"]').val();
+        if (price && capacity) {
+            $('.room-price').text(price.toFixed(2));
+            $('.room-capacity').text(capacity);
+            $('.selected-room-info').slideDown();
             
-            Swal.fire({
-                title: 'Update Status?',
-                html: `Are you sure you want to change the status from <b>${currentStatus}</b> to <b>${newStatus}</b>?`,
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#3085d6',
-                cancelButtonColor: '#d33',
-                confirmButtonText: 'Yes, update it!'
-            }).then((result) => {
-                if (result.isConfirmed) {
-                    this.submit();
-                }
-            });
-        });
+            // Update price calculation if dates are already selected
+            calculatePrice();
+        } else {
+            $('.selected-room-info').slideUp();
+            $('.price-calculation').slideUp();
+        }
+        
+        // Reset and validate number of people
+        $('#num_people').val('');
+        validatePeople();
     });
-</script> 
+
+    // Calculate price when dates change
+    $('#checkin_date, #checkout_date').change(function() {
+        calculatePrice();
+        validateDates();
+    });
+
+    // Validate number of people
+    $('#num_people').on('input', function() {
+        validatePeople();
+    });
+
+    // Price calculation function
+    function calculatePrice() {
+        var checkinDate = $('#checkin_date').val();
+        var checkoutDate = $('#checkout_date').val();
+        var pricePerDay = parseFloat($('#room_id option:selected').data('price')) || 0;
+        
+        if (checkinDate && checkoutDate && pricePerDay) {
+            var checkin = new Date(checkinDate + 'T14:00:00');
+            var checkout = new Date(checkoutDate + 'T12:00:00');
+            
+            if (checkout > checkin) {
+                var timeDiff = checkout.getTime() - checkin.getTime();
+                var numDays = Math.ceil(timeDiff / (1000 * 3600 * 24));
+                var totalPrice = numDays * pricePerDay;
+                
+                $('.num-days').text(numDays);
+                $('.price-per-day').text(pricePerDay.toFixed(2));
+                $('.total-price').text(totalPrice.toFixed(2));
+                $('.price-calculation').slideDown();
+            }
+        }
+    }
+
+    // Date validation function
+    function validateDates() {
+        var checkinDate = $('#checkin_date').val();
+        var checkoutDate = $('#checkout_date').val();
+        var submitBtn = $('button[type="submit"]');
+        
+        if (checkinDate && checkoutDate) {
+            var checkin = new Date(checkinDate + 'T14:00:00');
+            var checkout = new Date(checkoutDate + 'T12:00:00');
+            var today = new Date();
+            today.setHours(0, 0, 0, 0);
+            
+            if (checkin < today) {
+                alert('Check-in date cannot be in the past');
+                $('#checkin_date').val('');
+                submitBtn.prop('disabled', true);
+                return false;
+            }
+            
+            if (checkout <= checkin) {
+                alert('Check-out date must be after check-in date');
+                $('#checkout_date').val('');
+                submitBtn.prop('disabled', true);
+                return false;
+            }
+            
+            submitBtn.prop('disabled', false);
+            return true;
+        }
+    }
+
+    // People validation function
+    function validatePeople() {
+        var numPeople = parseInt($('#num_people').val()) || 0;
+        var capacity = parseInt($('#room_id option:selected').data('capacity')) || 0;
+        var submitBtn = $('button[type="submit"]');
+        
+        if (numPeople > capacity) {
+            $('#num_people').addClass('is-invalid');
+            submitBtn.prop('disabled', true);
+        } else {
+            $('#num_people').removeClass('is-invalid');
+            submitBtn.prop('disabled', false);
+        }
+    }
+
+    // Form validation
+    $('#reservationForm').on('submit', function(e) {
+        if (!validateDates()) {
+            e.preventDefault();
+            return false;
+        }
+        
+        var numPeople = parseInt($('#num_people').val());
+        var capacity = parseInt($('#room_id option:selected').data('capacity'));
+        
+        if (numPeople > capacity) {
+            e.preventDefault();
+            alert('Number of people exceeds room capacity');
+            return false;
+        }
+        
+        // All validations passed
+        return true;
+    });
+});
+</script>
+</body>
+</html> 
